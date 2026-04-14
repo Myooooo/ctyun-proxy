@@ -5,6 +5,7 @@ import os
 
 import httpx
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 logging.basicConfig(
@@ -14,6 +15,13 @@ logging.basicConfig(
 logger = logging.getLogger("ctyun-proxy")
 
 app = FastAPI(title="CTYun Coding Plan Proxy")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 CTYUN_BASE_URL = os.getenv("CTYUN_BASE_URL", "https://wishub-x6.ctyun.cn/coding")
 DEFAULT_MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
