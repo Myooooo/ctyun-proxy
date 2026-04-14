@@ -29,6 +29,7 @@ app.add_middleware(
 CTYUN_BASE_URL = os.getenv("CTYUN_BASE_URL", "https://wishub-x6.ctyun.cn/coding")
 DEFAULT_MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "300"))
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "GLM-5.1")
 PORT = int(os.getenv("PORT", "8080"))
 
 HOP_BY_HOP = {
@@ -54,6 +55,21 @@ def _is_chat_completions(path: str) -> bool:
 def _is_messages(path: str) -> bool:
     segments = path.split("/")
     return segments and segments[-1].split("?")[0] == "messages"
+
+
+def _override_model(body: bytes) -> bytes:
+    """Replace the model field in the request body with DEFAULT_MODEL."""
+    try:
+        data = json.loads(body)
+        if isinstance(data, dict) and "model" in data:
+            original = data["model"]
+            data["model"] = DEFAULT_MODEL
+            if original != DEFAULT_MODEL:
+                logger.debug(f"Model overridden: {original} → {DEFAULT_MODEL}")
+            return json.dumps(data).encode("utf-8")
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return body
 
 
 def _parse_stream_flag(body: bytes) -> bool:
@@ -112,10 +128,13 @@ async def _retry_request(target_url: str, headers: dict, body: bytes, method: st
 
                 # Success — stream response; close resources in generator finally block
                 async def generate(r=resp, c=client):
+                    collected = []
                     try:
                         async for chunk in r.aiter_bytes():
+                            collected.append(chunk)
                             yield chunk
                     finally:
+                        logger.debug(f"Stream response: {b''.join(collected)[:2000].decode('utf-8', errors='replace')}")
                         await r.aclose()
                         await c.aclose()
 
@@ -140,6 +159,7 @@ async def _retry_request(target_url: str, headers: dict, body: bytes, method: st
 
                 content = resp.content
                 status = resp.status_code
+                logger.debug(f"Response body: {content[:2000].decode('utf-8', errors='replace')}")
                 if resp.status_code >= 400:
                     logger.warning(f"Upstream error {resp.status_code}: {content[:1000]}")
                     await client.aclose()
@@ -186,11 +206,13 @@ async def proxy_v1(request: Request, path: str):
     body = await request.body()
 
     if _is_chat_completions(path):
-        logger.info(f"→ chat/completions (retry={DEFAULT_MAX_RETRIES})")
+        body = _override_model(body)
+        logger.info(f"→ chat/completions model={DEFAULT_MODEL} (retry={DEFAULT_MAX_RETRIES})")
         return await _retry_request(target_url, headers, body, request.method, DEFAULT_MAX_RETRIES)
 
     if _is_messages(path):
-        logger.info(f"→ messages (retry={DEFAULT_MAX_RETRIES})")
+        body = _override_model(body)
+        logger.info(f"→ messages model={DEFAULT_MODEL} (retry={DEFAULT_MAX_RETRIES})")
         return await _retry_request(target_url, headers, body, request.method, DEFAULT_MAX_RETRIES)
 
     logger.info(f"→ {path}")
@@ -210,9 +232,11 @@ async def proxy_root(request: Request, path: str):
     body = await request.body()
 
     if _is_chat_completions(path):
+        body = _override_model(body)
         return await _retry_request(target_url, headers, body, request.method, DEFAULT_MAX_RETRIES)
 
     if _is_messages(path):
+        body = _override_model(body)
         return await _retry_request(target_url, headers, body, request.method, DEFAULT_MAX_RETRIES)
 
     return await _simple_proxy(target_url, headers, body, request.method)
