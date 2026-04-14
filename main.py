@@ -9,10 +9,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("ctyun-proxy")
+# Quiet down noisy loggers
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 app = FastAPI(title="CTYun Coding Plan Proxy")
 
@@ -68,38 +71,85 @@ async def _backoff(attempt: int):
     await asyncio.sleep(min(2 ** (attempt - 1), 30))
 
 
-async def _stream_response(client: httpx.AsyncClient, method: str, url: str, headers: dict, body: bytes):
-    async with client.stream(method, url, headers=headers, content=body) as resp:
-        async def generate():
-            async for chunk in resp.aiter_bytes():
-                yield chunk
-        return StreamingResponse(generate(), status_code=resp.status_code, headers=_clean_headers(resp.headers))
+def _should_retry(status_code: int) -> bool:
+    return status_code == 429 or status_code >= 500
 
 
 async def _retry_request(target_url: str, headers: dict, body: bytes, method: str, max_retries: int):
     """Retry logic for chat completions and messages endpoints."""
     is_stream = _parse_stream_flag(body)
     last_exc: Exception | None = None
-    last_resp: httpx.Response | None = None
+    last_status: int = 0
+    last_body: bytes = b""
+    last_headers: dict = {}
 
     for attempt in range(1, max_retries + 1):
+        client = httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT))
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT)) as client:
-                if is_stream:
-                    return await _stream_response(client, method, target_url, headers, body)
+            logger.debug(f"Request body: {body[:2000]}")
+            if is_stream:
+                # For streaming: open the connection, check status, then stream or retry
+                req = client.build_request(method, target_url, headers=headers, content=body)
+                resp = await client.send(req, stream=True)
 
-                resp = await client.request(method, target_url, headers=headers, content=body)
-                should_retry = resp.status_code == 429 or resp.status_code >= 500
-
-                if should_retry and attempt < max_retries:
+                if _should_retry(resp.status_code) and attempt < max_retries:
                     logger.warning(f"Attempt {attempt}/{max_retries} got {resp.status_code}, retrying...")
-                    last_resp = resp
+                    last_status = resp.status_code
+                    last_body = await resp.aread()
+                    last_headers = dict(resp.headers)
+                    await resp.aclose()
+                    await client.aclose()
                     await _backoff(attempt)
                     continue
 
-                return Response(content=resp.content, status_code=resp.status_code, headers=_clean_headers(resp.headers))
+                if resp.status_code >= 400:
+                    # Upstream error: return 200 with error info
+                    content = await resp.aread()
+                    logger.warning(f"Upstream error {resp.status_code}: {content[:1000]}")
+                    await resp.aclose()
+                    await client.aclose()
+                    return Response(content=content, status_code=200, media_type="application/json")
+
+                # Success — stream response; close resources in generator finally block
+                async def generate(r=resp, c=client):
+                    try:
+                        async for chunk in r.aiter_bytes():
+                            yield chunk
+                    finally:
+                        await r.aclose()
+                        await c.aclose()
+
+                return StreamingResponse(
+                    generate(),
+                    status_code=resp.status_code,
+                    headers=_clean_headers(dict(resp.headers)),
+                )
+
+            else:
+                # Non-streaming
+                resp = await client.request(method, target_url, headers=headers, content=body)
+
+                if _should_retry(resp.status_code) and attempt < max_retries:
+                    logger.warning(f"Attempt {attempt}/{max_retries} got {resp.status_code}, retrying...")
+                    last_status = resp.status_code
+                    last_body = resp.content
+                    last_headers = dict(resp.headers)
+                    await client.aclose()
+                    await _backoff(attempt)
+                    continue
+
+                content = resp.content
+                status = resp.status_code
+                if resp.status_code >= 400:
+                    logger.warning(f"Upstream error {resp.status_code}: {content[:1000]}")
+                    await client.aclose()
+                    return Response(content=content, status_code=200, media_type="application/json")
+                hdrs = _clean_headers(dict(resp.headers))
+                await client.aclose()
+                return Response(content=content, status_code=status, headers=hdrs)
 
         except Exception as exc:
+            await client.aclose()
             last_exc = exc
             if attempt < max_retries:
                 logger.warning(f"Attempt {attempt}/{max_retries} error: {exc}, retrying...")
@@ -107,9 +157,10 @@ async def _retry_request(target_url: str, headers: dict, body: bytes, method: st
                 continue
 
     # All retries exhausted
-    if last_resp is not None:
-        return Response(content=last_resp.content, status_code=last_resp.status_code, headers=_clean_headers(last_resp.headers))
-    return JSONResponse(status_code=502, content={"error": {"message": str(last_exc), "type": "proxy_error"}})
+    if last_status:
+        logger.warning(f"All retries exhausted, last status: {last_status}")
+        return Response(content=last_body, status_code=200, media_type="application/json")
+    return JSONResponse(status_code=200, content={"error": {"message": str(last_exc), "type": "proxy_error"}})
 
 
 async def _simple_proxy(target_url: str, headers: dict, body: bytes, method: str):
@@ -117,7 +168,7 @@ async def _simple_proxy(target_url: str, headers: dict, body: bytes, method: str
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT)) as client:
             resp = await client.request(method, target_url, headers=headers, content=body)
-            return Response(content=resp.content, status_code=resp.status_code, headers=_clean_headers(resp.headers))
+            return Response(content=resp.content, status_code=resp.status_code, headers=_clean_headers(dict(resp.headers)))
     except Exception as exc:
         logger.error(f"Non-critical request failed: {exc}")
         return JSONResponse(status_code=200, content={"error": {"message": str(exc), "type": "proxy_error"}})
