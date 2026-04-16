@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 
 import httpx
 from fastapi import FastAPI, Request
@@ -81,14 +82,20 @@ def _parse_stream_flag(body: bytes) -> bool:
 
 
 def _parse_request_meta(body: bytes) -> dict:
-    """Extract stream, message count, max_tokens, model from request body."""
+    """Extract stream, message count, max_tokens, model, input_chars from request body."""
     try:
         data = json.loads(body)
         messages = data.get("messages", [])
+        input_chars = sum(
+            len(m.get("content", "")) if isinstance(m.get("content"), str)
+            else sum(len(c.get("text", "")) for c in m.get("content", []) if isinstance(c, dict))
+            for m in messages if isinstance(m, dict)
+        )
         return {
             "stream": data.get("stream", False),
             "model": data.get("model", "?"),
             "messages": len(messages),
+            "input_chars": input_chars,
             "max_tokens": data.get("max_tokens"),
         }
     except (json.JSONDecodeError, ValueError):
@@ -183,12 +190,14 @@ async def _retry_request(target_url: str, headers: dict, body: bytes, method: st
     last_status: int = 0
     last_body: bytes = b""
     last_headers: dict = {}
+    start_time = time.time()
 
     for attempt in range(1, max_retries + 1):
         client = httpx.AsyncClient(timeout=_make_timeout())
         try:
             meta = _parse_request_meta(body)
-            logger.info(f"↑ attempt {attempt}/{max_retries} {meta} body={len(body)} bytes")
+            input_chars = meta.get("input_chars", 0)
+            logger.info(f"↑ attempt {attempt}/{max_retries} model={meta.get('model', '?')} msgs={meta.get('messages', 0)} input_chars={input_chars} body={len(body)} bytes")
             if is_stream:
                 # For streaming: open the connection, check status, then stream or retry
                 req = client.build_request(method, target_url, headers=headers, content=body)
@@ -232,7 +241,7 @@ async def _retry_request(target_url: str, headers: dict, body: bytes, method: st
                     return JSONResponse(status_code=502, content={"error": {"message": str(chunk_exc), "type": "proxy_error"}})
 
                 # Stream verified — commit response
-                async def generate(r=resp, c=client, fc=first_chunks, si=stream_iter):
+                async def generate(r=resp, c=client, fc=first_chunks, si=stream_iter, st=start_time):
                     collected = list(fc)
                     try:
                         for chunk in fc:
@@ -244,9 +253,13 @@ async def _retry_request(target_url: str, headers: dict, body: bytes, method: st
                         logger.warning(f"Stream interrupted after {sum(len(c) for c in collected)} bytes: {exc}")
                     finally:
                         total_bytes = sum(len(c) for c in collected)
+                        elapsed = time.time() - st
                         usage = _extract_stream_usage(collected)
-                        usage_str = f" usage={usage}" if usage else ""
-                        logger.info(f"↓ stream done{usage_str} bytes={total_bytes}")
+                        usage_str = (
+                            f" input_tokens={usage['prompt_tokens']} output_tokens={usage['completion_tokens']}"
+                            if usage else ""
+                        )
+                        logger.info(f"↓ stream done{usage_str} bytes={total_bytes} time={elapsed:.2f}s")
                         await r.aclose()
                         await c.aclose()
 
@@ -271,9 +284,13 @@ async def _retry_request(target_url: str, headers: dict, body: bytes, method: st
 
                 content = resp.content
                 status = resp.status_code
+                elapsed = time.time() - start_time
                 resp_usage = _parse_response_usage(content)
-                usage_str = f" usage={resp_usage}" if resp_usage else ""
-                logger.info(f"↓ {status}{usage_str} bytes={len(content)}")
+                usage_str = (
+                    f" input_tokens={resp_usage['prompt_tokens']} output_tokens={resp_usage['completion_tokens']}"
+                    if resp_usage else ""
+                )
+                logger.info(f"↓ {status}{usage_str} bytes={len(content)} time={elapsed:.2f}s")
                 if resp.status_code >= 400:
                     _log_upstream_error(target_url, method, headers, body,
                                         resp.status_code, content, attempt, max_retries)
@@ -330,12 +347,14 @@ async def proxy_v1(request: Request, path: str):
 
     if _is_chat_completions(path):
         body = _override_model(body)
-        logger.info(f"→ chat/completions {_parse_request_meta(body)} (retry={DEFAULT_MAX_RETRIES})")
+        meta = _parse_request_meta(body)
+        logger.info(f"→ chat/completions model={meta.get('model', '?')} msgs={meta.get('messages', 0)} input_chars={meta.get('input_chars', 0)} (retry={DEFAULT_MAX_RETRIES})")
         return await _retry_request(target_url, headers, body, request.method, DEFAULT_MAX_RETRIES)
 
     if _is_messages(path):
         body = _override_model(body)
-        logger.info(f"→ messages {_parse_request_meta(body)} (retry={DEFAULT_MAX_RETRIES})")
+        meta = _parse_request_meta(body)
+        logger.info(f"→ messages model={meta.get('model', '?')} msgs={meta.get('messages', 0)} input_chars={meta.get('input_chars', 0)} (retry={DEFAULT_MAX_RETRIES})")
         return await _retry_request(target_url, headers, body, request.method, DEFAULT_MAX_RETRIES)
 
     logger.info(f"→ {path}")
