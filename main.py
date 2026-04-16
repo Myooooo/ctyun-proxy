@@ -80,8 +80,70 @@ def _parse_stream_flag(body: bytes) -> bool:
         return False
 
 
+def _parse_request_meta(body: bytes) -> dict:
+    """Extract stream, message count, max_tokens, model from request body."""
+    try:
+        data = json.loads(body)
+        messages = data.get("messages", [])
+        return {
+            "stream": data.get("stream", False),
+            "model": data.get("model", "?"),
+            "messages": len(messages),
+            "max_tokens": data.get("max_tokens"),
+        }
+    except (json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _parse_response_usage(body: bytes) -> dict | None:
+    """Extract token usage from non-streaming response body."""
+    try:
+        data = json.loads(body)
+        usage = data.get("usage")
+        if usage:
+            return {
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            }
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
+def _extract_stream_usage(chunks: list[bytes]) -> dict | None:
+    """Extract token usage from collected SSE stream chunks."""
+    for chunk in reversed(chunks):
+        text = chunk.decode("utf-8", errors="replace")
+        for line in text.splitlines():
+            if line.startswith("data: ") and line != "data: [DONE]":
+                try:
+                    data = json.loads(line[6:])
+                    usage = data.get("usage")
+                    if usage:
+                        return {
+                            "prompt_tokens": usage.get("prompt_tokens", 0),
+                            "completion_tokens": usage.get("completion_tokens", 0),
+                            "total_tokens": usage.get("total_tokens", 0),
+                        }
+                except (json.JSONDecodeError, ValueError):
+                    continue
+    return None
+
+
 def _clean_headers(headers: dict) -> dict:
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
+
+
+def _mask_auth(headers: dict) -> dict:
+    """Return headers dict with authorization values masked for safe logging."""
+    masked = {}
+    for k, v in headers.items():
+        if k.lower() == "authorization" and len(v) > 10:
+            masked[k] = v[:10] + "..."
+        else:
+            masked[k] = v
+    return masked
 
 
 async def _backoff(attempt: int):
@@ -96,6 +158,24 @@ def _make_timeout() -> httpx.Timeout:
     return httpx.Timeout(connect=30.0, read=REQUEST_TIMEOUT, write=60.0, pool=30.0)
 
 
+def _log_upstream_error(target_url: str, method: str, req_headers: dict, req_body: bytes,
+                        status_code: int, resp_body: bytes, attempt: int, max_retries: int):
+    """Log upstream error with full request context for debugging."""
+    meta = _parse_request_meta(req_body)
+    body_preview = req_body[:2000].decode("utf-8", errors="replace")
+    resp_text = resp_body[:2000].decode("utf-8", errors="replace")
+    resp_usage = _parse_response_usage(resp_body)
+    usage_str = f"  Response usage: {resp_usage}\n" if resp_usage else ""
+    logger.warning(
+        f"Upstream error (attempt {attempt}/{max_retries}): "
+        f"{method} {target_url} → {status_code}\n"
+        f"  Request meta: {meta}\n"
+        f"  Request body: {body_preview}\n"
+        f"  Response body: {resp_text}\n"
+        f"{usage_str}"
+    )
+
+
 async def _retry_request(target_url: str, headers: dict, body: bytes, method: str, max_retries: int):
     """Retry logic for chat completions and messages endpoints."""
     is_stream = _parse_stream_flag(body)
@@ -107,7 +187,8 @@ async def _retry_request(target_url: str, headers: dict, body: bytes, method: st
     for attempt in range(1, max_retries + 1):
         client = httpx.AsyncClient(timeout=_make_timeout())
         try:
-            logger.debug(f"Request body length: {len(body)} bytes")
+            meta = _parse_request_meta(body)
+            logger.info(f"↑ attempt {attempt}/{max_retries} {meta} body={len(body)} bytes")
             if is_stream:
                 # For streaming: open the connection, check status, then stream or retry
                 req = client.build_request(method, target_url, headers=headers, content=body)
@@ -125,7 +206,8 @@ async def _retry_request(target_url: str, headers: dict, body: bytes, method: st
 
                 if resp.status_code >= 400:
                     content = await resp.aread()
-                    logger.warning(f"Upstream error {resp.status_code}: {content[:1000]}")
+                    _log_upstream_error(target_url, method, headers, body,
+                                        resp.status_code, content, attempt, max_retries)
                     await resp.aclose()
                     await client.aclose()
                     return Response(content=content, status_code=resp.status_code, media_type="application/json")
@@ -161,7 +243,10 @@ async def _retry_request(target_url: str, headers: dict, body: bytes, method: st
                     except Exception as exc:
                         logger.warning(f"Stream interrupted after {sum(len(c) for c in collected)} bytes: {exc}")
                     finally:
-                        logger.debug(f"Stream response body length: {sum(len(c) for c in collected)} bytes")
+                        total_bytes = sum(len(c) for c in collected)
+                        usage = _extract_stream_usage(collected)
+                        usage_str = f" usage={usage}" if usage else ""
+                        logger.info(f"↓ stream done{usage_str} bytes={total_bytes}")
                         await r.aclose()
                         await c.aclose()
 
@@ -186,9 +271,12 @@ async def _retry_request(target_url: str, headers: dict, body: bytes, method: st
 
                 content = resp.content
                 status = resp.status_code
-                logger.debug(f"Response body length: {len(content)} bytes")
+                resp_usage = _parse_response_usage(content)
+                usage_str = f" usage={resp_usage}" if resp_usage else ""
+                logger.info(f"↓ {status}{usage_str} bytes={len(content)}")
                 if resp.status_code >= 400:
-                    logger.warning(f"Upstream error {resp.status_code}: {content[:1000]}")
+                    _log_upstream_error(target_url, method, headers, body,
+                                        resp.status_code, content, attempt, max_retries)
                     await client.aclose()
                     return Response(content=content, status_code=resp.status_code, media_type="application/json")
                 hdrs = _clean_headers(dict(resp.headers))
@@ -205,8 +293,16 @@ async def _retry_request(target_url: str, headers: dict, body: bytes, method: st
 
     # All retries exhausted
     if last_status:
-        logger.warning(f"All retries exhausted, last status: {last_status}")
+        _log_upstream_error(target_url, method, headers, body,
+                            last_status, last_body, max_retries, max_retries)
         return Response(content=last_body, status_code=last_status, media_type="application/json")
+    logger.error(
+        f"All retries exhausted: {method} {target_url}\n"
+        f"  Request meta: {_parse_request_meta(body)}\n"
+        f"  Request headers: {_mask_auth(headers)}\n"
+        f"  Request body: {body[:2000].decode('utf-8', errors='replace')}\n"
+        f"  Last exception: {last_exc}"
+    )
     return JSONResponse(status_code=502, content={"error": {"message": str(last_exc), "type": "proxy_error"}})
 
 
@@ -234,12 +330,12 @@ async def proxy_v1(request: Request, path: str):
 
     if _is_chat_completions(path):
         body = _override_model(body)
-        logger.info(f"→ chat/completions model={DEFAULT_MODEL} (retry={DEFAULT_MAX_RETRIES})")
+        logger.info(f"→ chat/completions {_parse_request_meta(body)} (retry={DEFAULT_MAX_RETRIES})")
         return await _retry_request(target_url, headers, body, request.method, DEFAULT_MAX_RETRIES)
 
     if _is_messages(path):
         body = _override_model(body)
-        logger.info(f"→ messages model={DEFAULT_MODEL} (retry={DEFAULT_MAX_RETRIES})")
+        logger.info(f"→ messages {_parse_request_meta(body)} (retry={DEFAULT_MAX_RETRIES})")
         return await _retry_request(target_url, headers, body, request.method, DEFAULT_MAX_RETRIES)
 
     logger.info(f"→ {path}")
