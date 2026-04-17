@@ -3,6 +3,11 @@ import json
 import logging
 import os
 import time
+from urllib.parse import urlparse
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import httpx
 from fastapi import FastAPI, Request
@@ -27,7 +32,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Configuration ────────────────────────────────────────────────────────────
+
 CTYUN_BASE_URL = os.getenv("CTYUN_BASE_URL", "https://wishub-x6.ctyun.cn/coding")
+UPSTREAM_HOST = urlparse(CTYUN_BASE_URL).hostname
+API_KEY = os.getenv("API_KEY", "")
 DEFAULT_MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "600"))
 STREAM_FIRST_CHUNK_TIMEOUT = float(os.getenv("STREAM_FIRST_CHUNK_TIMEOUT", "60"))
@@ -46,7 +55,9 @@ def _forward_headers(request: Request) -> dict:
     for k, v in request.headers.items():
         if k.lower() not in HOP_BY_HOP:
             headers[k] = v
-    headers["host"] = "wishub-x6.ctyun.cn"
+    headers["host"] = UPSTREAM_HOST
+    if API_KEY:
+        headers["authorization"] = f"Bearer {API_KEY}"
     return headers
 
 
@@ -60,7 +71,9 @@ def _is_messages(path: str) -> bool:
 
 
 def _override_model(body: bytes) -> bytes:
-    """Replace the model field in the request body with DEFAULT_MODEL."""
+    """Replace the model field in the request body with DEFAULT_MODEL (if set)."""
+    if not DEFAULT_MODEL:
+        return body
     try:
         data = json.loads(body)
         if isinstance(data, dict) and "model" in data:
@@ -336,12 +349,8 @@ async def _simple_proxy(target_url: str, headers: dict, body: bytes, method: str
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
-@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def proxy_v1(request: Request, path: str):
-    target_url = f"{CTYUN_BASE_URL}/v1/{path}"
-    if request.url.query:
-        target_url += f"?{request.url.query}"
-
+async def _proxy_request(request: Request, target_url: str, path: str):
+    """Common proxy logic for all versioned and root endpoints."""
     headers = _forward_headers(request)
     body = await request.body()
 
@@ -361,27 +370,38 @@ async def proxy_v1(request: Request, path: str):
     return await _simple_proxy(target_url, headers, body, request.method)
 
 
+def _build_target_url(request: Request, version_prefix: str, path: str) -> str:
+    target_url = f"{CTYUN_BASE_URL}/{version_prefix}{path}"
+    if request.url.query:
+        target_url += f"?{request.url.query}"
+    return target_url
+
+
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy_v1(request: Request, path: str):
+    return await _proxy_request(request, _build_target_url(request, "v1/", path), path)
+
+
+@app.api_route("/v2/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy_v2(request: Request, path: str):
+    return await _proxy_request(request, _build_target_url(request, "v2/", path), path)
+
+
+@app.api_route("/v3/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy_v3(request: Request, path: str):
+    return await _proxy_request(request, _build_target_url(request, "v3/", path), path)
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_root(request: Request, path: str):
     if path in ("docs", "openapi.json", "redoc"):
         return
 
+    # Paths already starting with v1/v2/v3 but not matched above (shouldn't happen, fallback)
     target_url = f"{CTYUN_BASE_URL}/v1/{path}"
     if request.url.query:
         target_url += f"?{request.url.query}"
-
-    headers = _forward_headers(request)
-    body = await request.body()
-
-    if _is_chat_completions(path):
-        body = _override_model(body)
-        return await _retry_request(target_url, headers, body, request.method, DEFAULT_MAX_RETRIES)
-
-    if _is_messages(path):
-        body = _override_model(body)
-        return await _retry_request(target_url, headers, body, request.method, DEFAULT_MAX_RETRIES)
-
-    return await _simple_proxy(target_url, headers, body, request.method)
+    return await _proxy_request(request, target_url, path)
 
 
 @app.get("/")
